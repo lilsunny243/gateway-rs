@@ -154,8 +154,8 @@ fn default_api() -> u16 {
 }
 
 fn default_beacon_interval() -> u64 {
-    // 3x daily with a few seconds to spare.
-    8 * (3600 - 1)
+    // EVERY 10 MINUTES; THIS IS ONLY FOR TESTING DO NOT MERGE
+    600
 }
 
 #[derive(Debug)]
