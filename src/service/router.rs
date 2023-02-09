@@ -1,127 +1,158 @@
-use crate::{service::CONNECT_TIMEOUT, KeyedUri, Result};
-use helium_proto::{
-    services::{self, Channel, Endpoint},
-    BlockchainStateChannelMessageV1,
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::{sync::mpsc, time::Duration};
+
+use crate::{
+    error::DecodeError,
+    service::{CONNECT_TIMEOUT, RPC_TIMEOUT},
+    Error, Keypair, MsgSign, Result,
+};
+
+use helium_proto::services::{
+    router::{
+        envelope_down_v1, envelope_up_v1, EnvelopeDownV1, EnvelopeUpV1, PacketRouterClient,
+        PacketRouterPacketDownV1, PacketRouterPacketUpV1, PacketRouterRegisterV1,
+    },
+    Channel, Endpoint,
+};
+
+use http::Uri;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-type RouterClient = services::router::RouterClient<Channel>;
-type StateChannelClient = services::router::StateChannelClient<Channel>;
+type PacketClient = PacketRouterClient<Channel>;
 
+type PacketSender = mpsc::Sender<EnvelopeUpV1>;
+type PacketReceiver = tonic::Streaming<EnvelopeDownV1>;
+
+// The router service maintains a re-connectable connection to a remote packet
+// router. The service will connect when (re)connect or a packet send is
+// attempted. It will ensure that the register rpc is called on the constructed
+// connection before a packet is sent.
 #[derive(Debug)]
 pub struct RouterService {
-    pub uri: KeyedUri,
-    router_client: RouterClient,
-    state_channel_client: StateChannelClient,
+    pub uri: Uri,
+    conduit: Option<RouterConduit>,
+    keypair: Arc<Keypair>,
 }
 
+/// A router conduit is the tx/rx stream pair for the `route` rpc on the
+/// `packet_router` service. It does not connect on construction but on the
+/// first messsage sent.
 #[derive(Debug)]
-pub struct StateChannelService {
-    client: StateChannelClient,
-    conduit: Option<(
-        mpsc::Sender<BlockchainStateChannelMessageV1>,
-        tonic::Streaming<BlockchainStateChannelMessageV1>,
-    )>,
+struct RouterConduit {
+    tx: PacketSender,
+    rx: PacketReceiver,
 }
 
 pub const CONDUIT_CAPACITY: usize = 50;
 
-impl StateChannelService {
-    pub async fn send(&mut self, msg: BlockchainStateChannelMessageV1) -> Result {
-        if self.conduit.is_none() {
-            self.conduit = Some(self.mk_conduit().await?)
+impl RouterConduit {
+    async fn new(uri: Uri) -> Result<Self> {
+        let endpoint = Endpoint::from(uri)
+            .timeout(RPC_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .connect_lazy();
+        let mut client = PacketClient::new(endpoint);
+        let (tx, client_rx) = mpsc::channel(CONDUIT_CAPACITY);
+        let rx = client
+            .route(ReceiverStream::new(client_rx))
+            .await?
+            .into_inner();
+        Ok(Self { tx, rx })
+    }
+
+    async fn recv(&mut self) -> Result<Option<PacketRouterPacketDownV1>> {
+        match self.rx.message().await {
+            Ok(Some(msg)) => match msg.data {
+                Some(envelope_down_v1::Data::Packet(packet)) => Ok(Some(packet)),
+                None => Err(DecodeError::invalid_envelope()),
+            },
+            Ok(None) => Ok(None),
+            Err(err) => Err(err.into()),
         }
-        let (tx, _) = self.conduit.as_ref().unwrap();
-        Ok(tx.send(msg).await?)
     }
 
-    pub fn capacity(&self) -> usize {
-        self.conduit
-            .as_ref()
-            .map(|(tx, _)| tx.capacity())
-            .unwrap_or(CONDUIT_CAPACITY)
+    async fn send(&mut self, msg: PacketRouterPacketUpV1) -> Result {
+        let msg = EnvelopeUpV1 {
+            data: Some(envelope_up_v1::Data::Packet(msg)),
+        };
+        Ok(self.tx.send(msg).await?)
     }
 
-    pub async fn message(&mut self) -> Result<Option<BlockchainStateChannelMessageV1>> {
+    async fn register(&mut self, keypair: Arc<Keypair>) -> Result {
+        let mut msg = PacketRouterRegisterV1 {
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(Error::from)?
+                .as_millis() as u64,
+            gateway: keypair.public_key().into(),
+            signature: vec![],
+        };
+        msg.signature = msg.sign(keypair.clone()).await?;
+        let msg = EnvelopeUpV1 {
+            data: Some(envelope_up_v1::Data::Register(msg)),
+        };
+        Ok(self.tx.send(msg).await?)
+    }
+}
+
+impl RouterService {
+    pub fn new(uri: Uri, keypair: Arc<Keypair>) -> Self {
+        Self {
+            uri,
+            conduit: None,
+            keypair,
+        }
+    }
+
+    pub async fn send(&mut self, msg: PacketRouterPacketUpV1) -> Result {
         if self.conduit.is_none() {
-            let () = futures::future::pending().await;
+            self.connect().await?;
+        }
+        // Unwrap since the above connect early exits if no conduit is created
+        match self.conduit.as_mut().unwrap().send(msg).await {
+            Ok(()) => Ok(()),
+            other => {
+                self.disconnect();
+                other
+            }
+        }
+    }
+
+    pub async fn recv(&mut self) -> Result<Option<PacketRouterPacketDownV1>> {
+        // Since recv is usually called from a select loop we don't try a
+        // connect every time it is called since the rate for attempted
+        // connections in failure setups would be as high as the loop rate of
+        // the caller. This relies on either a reconnect attempt or a packet
+        // send at a later time to reconnect the conduit.
+        if self.conduit.is_none() {
+            futures::future::pending::<()>().await;
             return Ok(None);
         }
-        let (_, rx) = self.conduit.as_mut().unwrap();
-        match rx.message().await {
-            Ok(Some(msg)) => Ok(Some(msg)),
-            Ok(None) => {
+        match self.conduit.as_mut().unwrap().recv().await {
+            Ok(msg) if msg.is_some() => Ok(msg),
+            other => {
                 self.disconnect();
-                Ok(None)
-            }
-            Err(err) => {
-                self.disconnect();
-                Err(err.into())
+                other
             }
         }
-    }
-
-    pub async fn connect(&mut self) -> Result {
-        if self.conduit.is_none() {
-            self.conduit = Some(self.mk_conduit().await?);
-        }
-        Ok(())
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.conduit.is_some()
     }
 
     pub fn disconnect(&mut self) {
         self.conduit = None;
     }
 
+    pub async fn connect(&mut self) -> Result {
+        let mut conduit = RouterConduit::new(self.uri.clone()).await?;
+        conduit.register(self.keypair.clone()).await?;
+        self.conduit = Some(conduit);
+        Ok(())
+    }
+
     pub async fn reconnect(&mut self) -> Result {
         self.disconnect();
         self.connect().await
-    }
-
-    pub async fn mk_conduit(
-        &mut self,
-    ) -> Result<(
-        mpsc::Sender<BlockchainStateChannelMessageV1>,
-        tonic::Streaming<BlockchainStateChannelMessageV1>,
-    )> {
-        let (tx, client_rx) = mpsc::channel(CONDUIT_CAPACITY);
-        let rx = self
-            .client
-            .msg(ReceiverStream::new(client_rx))
-            .await?
-            .into_inner();
-        Ok((tx, rx))
-    }
-}
-
-impl RouterService {
-    pub fn new(keyed_uri: KeyedUri) -> Result<Self> {
-        let router_channel = Endpoint::from(keyed_uri.uri.clone())
-            .timeout(Duration::from_secs(CONNECT_TIMEOUT))
-            .connect_lazy();
-        let state_channel = router_channel.clone();
-        Ok(Self {
-            uri: keyed_uri,
-            router_client: RouterClient::new(router_channel),
-            state_channel_client: StateChannelClient::new(state_channel),
-        })
-    }
-
-    pub async fn route(
-        &mut self,
-        msg: BlockchainStateChannelMessageV1,
-    ) -> Result<BlockchainStateChannelMessageV1> {
-        Ok(self.router_client.route(msg).await?.into_inner())
-    }
-
-    pub fn state_channel(&mut self) -> Result<StateChannelService> {
-        Ok(StateChannelService {
-            client: self.state_channel_client.clone(),
-            conduit: None,
-        })
     }
 }

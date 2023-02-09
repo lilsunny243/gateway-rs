@@ -8,63 +8,55 @@ on:
 name: ci
 
 jobs:
-  build:
-    name: hygiene
-    runs-on: ubuntu-latest
+  hygiene:
+    runs-on: ubuntu-22.04
+
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly
-          default: true
-          override: true
           components: clippy, rustfmt
 
-      - name: Cancel previous runs
-        uses: styfle/cancel-workflow-action@0.5.0
+      - name: cancel previous runs
+        uses: styfle/cancel-workflow-action@0.11.0
         with:
           access_token: ${{ github.token }}
 
-      - name: Check formatting
-        run: cargo fmt  -- --check
+      - name: install dependencies
+        run: sudo apt-get install -y libtss2-dev
 
-      - name: Clippy
-        uses: actions-rs/clippy-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: -- -Dclippy::all
+      - name: check formatting
+        run: |
+          cargo fmt  -- --check
 
-  package:
-    name: package
-    runs-on: ubuntu-latest
+      - name: clippy
+        run: |
+          cargo clippy --all-features -- -D clippy::all
+
+      - name: Run tests
+        run: cargo test
+
+  build:
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         target:
-          - klkgw
-          - ramips_24kec
-          - smartharvest
-          - dragino
-          - mtcdt
-          - raspi01
-          - raspi234
-          - resiot
-          - x86_64
-          - cotx
-          - raspi_64
-          - caldigit
-          - tektelic
-          - risinghf
-          - clodpi
+          - arm-unknown-linux-gnueabihf
+          - armv5te-unknown-linux-musleabi
+          - armv7-unknown-linux-gnueabihf
+          - armv7-unknown-linux-musleabihf
+          - aarch64-unknown-linux-gnu
+          - mips-unknown-linux-musl
+          - mipsel-unknown-linux-musl
+          - x86_64-tpm-debian-gnu
+
     steps:
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
       - uses: davidB/rust-cargo-make@v1
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: install cross
-        uses: jaxxstorm/action-install-gh-release@release/v1-alpha
+        uses: jaxxstorm/action-install-gh-release@v1.9.0
         env:
           ## Allow cross install into PATH
           ACTIONS_ALLOW_UNSECURE_COMMANDS: true
@@ -72,26 +64,34 @@ jobs:
         with:
           repo: rust-embedded/cross
 
-      - name: install cargo-deb
-        uses: actions-rs/cargo@v1
-        with:
-          command: install
-          args: cargo-deb
+      - name: build target
+        run: cargo make --profile ${{ matrix.target }} build
 
-      - name: build package
+      - name: package target
         run: cargo make --profile ${{ matrix.target }} pkg
 
-      - name: name release
-        if: startsWith(github.ref, 'refs/tags')
-        id: vars
-        run: echo ::set-output name=tag::${GITHUB_REF#refs/*/}
+      - name: cache artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: helium-gateway-${{ matrix.target }}
+          if-no-files-found: error
+          path: helium-gateway-*.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags')
+    needs: [hygiene, build]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: fetch cached binaries
+        uses: actions/download-artifact@v3
+        with:
+          path: helium-gateway-*.tar.gz
 
       - name: create release
         uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.vars.outputs.tag }}
-          name: Release ${{ steps.vars.outputs.tag }}
-          files: target/pkg/helium-gateway-${{ steps.vars.outputs.tag }}-${{ matrix.target }}.*
+          fail_on_unmatched_files: true
+          files: helium-gateway-*.tar.gz

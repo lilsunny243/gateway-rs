@@ -1,8 +1,6 @@
-use super::{
-    connect_uri, ConfigReq, ConfigValue, HeightReq, HeightRes, PubkeyReq, RegionReq, SignReq,
-};
-use crate::{error::Error, PublicKey, Region, Result};
-use helium_proto::services::local::Client;
+use super::{connect_uri, AddGatewayReq, GatewayStakingMode, PubkeyReq, RegionReq};
+use crate::{error::Error, settings::StakingMode, PublicKey, Region, Result, TxnEnvelope};
+use helium_proto::{services::local::Client, BlockchainTxnAddGatewayV1};
 use std::convert::TryFrom;
 use tonic::transport::{Channel, Endpoint};
 
@@ -20,31 +18,35 @@ impl LocalClient {
         Ok(Self { client })
     }
 
-    pub async fn pubkey(&mut self) -> Result<PublicKey> {
-        let response = self.client.pubkey(PubkeyReq {}).await?;
-        let public_key = PublicKey::try_from(response.into_inner().address)?;
-        Ok(public_key)
-    }
+    pub async fn pubkey(&mut self) -> Result<(PublicKey, PublicKey)> {
+        let response = self.client.pubkey(PubkeyReq {}).await?.into_inner();
 
-    pub async fn sign(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let response = self.client.sign(SignReq { data: data.into() }).await?;
-        let signature = response.into_inner().signature;
-        Ok(signature)
-    }
-
-    pub async fn config(&mut self, keys: &[&str]) -> Result<Vec<ConfigValue>> {
-        let keys = keys.iter().map(|s| s.to_string()).collect();
-        let response = self.client.config(ConfigReq { keys }).await?.into_inner();
-        Ok(response.values)
-    }
-
-    pub async fn height(&mut self) -> Result<HeightRes> {
-        let response = self.client.height(HeightReq {}).await?.into_inner();
-        Ok(response)
+        let public_key = PublicKey::try_from(response.address)?;
+        let onboarding_key = PublicKey::try_from(response.onboarding_address)?;
+        Ok((public_key, onboarding_key))
     }
 
     pub async fn region(&mut self) -> Result<Region> {
         let response = self.client.region(RegionReq {}).await?;
-        Region::from_i32(response.into_inner().region)
+        Ok(Region::from_i32(response.into_inner().region)?)
+    }
+
+    pub async fn add_gateway(
+        &mut self,
+        owner: &PublicKey,
+        payer: &PublicKey,
+        mode: &StakingMode,
+    ) -> Result<BlockchainTxnAddGatewayV1> {
+        let response = self
+            .client
+            .add_gateway(AddGatewayReq {
+                owner: owner.to_vec(),
+                payer: payer.to_vec(),
+                staking_mode: GatewayStakingMode::from(mode).into(),
+            })
+            .await?;
+        let encoded = response.into_inner().add_gateway_txn;
+        let txn = BlockchainTxnAddGatewayV1::from_envelope_vec(&encoded)?;
+        Ok(txn)
     }
 }

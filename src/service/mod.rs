@@ -1,4 +1,9 @@
-pub const CONNECT_TIMEOUT: u64 = 10;
+use std::time::Duration;
 
-pub mod gateway;
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub mod config;
+pub mod entropy;
+pub mod poc;
 pub mod router;

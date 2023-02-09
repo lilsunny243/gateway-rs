@@ -1,12 +1,12 @@
 [package]
 name = "lorawan"
 version = "0.1.0"
-authors = ["Marc Nijdam <marc_@helium.com>"]
+authors = ["Marc Nijdam <marc@nova-labs.com>"]
 edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-byteorder = "1.3"
+byteorder = {workspace = true}
 bitfield = "0.13"
 rand = "0.8.5"
 
